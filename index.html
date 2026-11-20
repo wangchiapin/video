@@ -60,8 +60,7 @@
     <div class="row">
       <label>語言
         <select id="lang">
-          <option value="auto">自動偵測（先試這個）</option>
-          <option value="chinese">固定中文</option>
+          <option value="chinese">固定中文（建議）</option>
           <option value="spanish">固定西班牙文</option>
         </select>
       </label>
@@ -69,12 +68,31 @@
       <button class="ghost" id="stopTx" disabled>停止</button>
       <button class="ghost" id="saveTx" disabled>儲存逐字稿</button>
     </div>
+    <div class="row" style="margin-top:8px">
+      <label>只轉這段時間（不填＝整支影片）
+        <input type="text" class="t" id="txS" placeholder="0:00"> – <input type="text" class="t" id="txE" placeholder="3:00"></label>
+      <label><input type="checkbox" id="stripPy" checked> 刪除括號裡的拼音</label>
+    </div>
     <div class="bar"><i id="barFill"></i></div>
     <div id="status" class="small"></div>
   </div>
 
   <div class="card">
-    <h2>③ 找段落</h2>
+    <h2>③ 讓 AI 幫你挑有趣的片段（選用）</h2>
+    <div class="hint">轉好文字後，按下面兩個按鈕，到你常用的 AI 聊天視窗各貼上一次：先貼「提示詞」，再貼「逐字稿」。AI 會列出有趣的片段和時間，你再回來這裡用時間剪出。注意：逐字稿裡有學生說的話，貼給 AI 之前請自己判斷，必要時先刪掉學生的個人資料。</div>
+    <div class="row">
+      <button id="copyPrompt">複製提示詞</button>
+      <button id="copyTx">複製逐字稿（附時間）</button>
+      <label><input type="checkbox" id="teacherOnly"> 以老師說的話為主</label>
+      <span class="small" id="copyMsg"></span>
+    </div>
+    <details style="margin-top:8px"><summary class="small" style="cursor:pointer">看提示詞內容</summary>
+      <textarea id="promptView" readonly style="width:100%;height:220px;margin-top:6px;font-family:inherit;font-size:13px;line-height:1.5;padding:8px;border:1px solid var(--line);border-radius:6px"></textarea>
+    </details>
+  </div>
+
+  <div class="card">
+    <h2>④ 找段落</h2>
     <div class="row" style="margin-bottom:8px">
       <input type="text" id="q" placeholder="輸入關鍵字，例如：把、cuánto、機場" style="flex:1;min-width:200px">
       <button class="ghost" id="prevHit">上一個</button>
@@ -95,12 +113,19 @@
   </div>
 
   <div class="card">
-    <h2>④ 剪輯清單</h2>
+    <h2>⑤ 剪輯清單</h2>
     <div class="row" style="margin-bottom:6px">
       <label><input type="checkbox" id="precise" checked> 精準剪（建議，剪出來剛好從你選的地方開始；比較慢）</label>
-      <button id="cutAll" disabled>全部剪出</button>
     </div>
-    <div class="small">取消勾選精準剪會變得很快，但開頭可能多出好幾秒（會停在前一個關鍵畫面），適合先粗剪看看。全部剪出時，瀏覽器可能會詢問是否允許下載多個檔案，請按允許。</div>
+    <div class="row" style="margin-bottom:6px">
+      <span>輸出方式：</span>
+      <label><input type="radio" name="outmode" value="separate" checked> 分開存成多個檔案</label>
+      <label><input type="radio" name="outmode" value="merge"> 合併成一個檔案（照清單順序）</label>
+      <input type="text" id="mergeName" placeholder="合併後的檔名（可不填）" style="min-width:200px">
+      <button id="cutAll" disabled>匯出已勾選的片段</button>
+      <span class="small" id="sumInfo"></span>
+    </div>
+    <div class="small">取消勾選精準剪會變得很快，但開頭可能多出好幾秒（會停在前一個關鍵畫面），適合先粗剪看看。每一段前面的方框勾起來才會匯出，可以用 ↑ ↓ 調順序。合併成一個檔案時一定會重新壓縮（等於精準剪）。分開存成多個檔案時，瀏覽器可能會詢問是否允許下載多個檔案，請按允許。</div>
     <div id="clips"><div class="small" style="padding:10px 0">還沒有加入任何片段。</div></div>
   </div>
 </div>
@@ -157,6 +182,9 @@ function refreshButtons(){
   document.querySelectorAll('.cutOne').forEach(b => b.disabled = busy);
 }
 let stopAllowed = false;
+function stripPinyin(t){
+  return t.replace(/(?<=[\u3400-\u9fff!?！？,.，。、])\s*[（(][^()（）\u3400-\u9fff]*[)）]/g, '');
+}
 function toBlobURL(url, mime){
   return fetch(url).then(r => { if(!r.ok) throw new Error('下載失敗：' + url); return r.blob(); })
     .then(b => URL.createObjectURL(new Blob([b], {type: mime})));
@@ -199,12 +227,16 @@ async function resetMount(){
 }
 
 /* 抽出 16kHz 單聲道音訊 */
-async function extractAudio(onProgress){
+async function extractAudio(onProgress, from = 0, dur = 0){
   const f = await ensureMounted();
-  const cb = ({time}) => { if(onProgress && duration) onProgress(Math.min(1, (time/1e6)/duration)); };
+  const span = dur || duration;
+  const cb = ({time}) => { if(onProgress && span) onProgress(Math.min(1, (time/1e6)/span)); };
   f.on('progress', cb);
   let code;
-  try { code = await f.exec(['-i','/in/input.mp4','-vn','-ac','1','-ar','16000','-f','s16le','/audio.pcm']); }
+  const pre = [];
+  if(from > 0) pre.push('-ss', String(from));
+  if(dur > 0) pre.push('-t', String(dur));
+  try { code = await f.exec([...pre, '-i','/in/input.mp4','-vn','-ac','1','-ar','16000','-f','s16le','/audio.pcm']); }
   finally { f.off('progress', cb); }
   if(code !== 0) throw new Error('抽出聲音失敗（這個檔案可能沒有聲音）');
   let u8 = await f.readFile('/audio.pcm');
@@ -218,10 +250,16 @@ async function transcribe(){
   if(!file || busy) return;
   stopFlag = false; stopAllowed = false; setBusy(true);
   try{
+    const vd = duration || $('vid').duration || 0;
+    let rs = parseTime($('txS').value), re = parseTime($('txE').value);
+    const partial = !isNaN(rs) || !isNaN(re);
+    if(isNaN(rs)) rs = 0;
+    if(isNaN(re) || (vd && re > vd)) re = vd || 0;
+    if(re && re <= rs) throw new Error('「只轉這段時間」的開始和結束不對，請檢查。');
     setStatus('正在抽出聲音…', 0);
-    const pcm = await extractAudio(p => setStatus('正在抽出聲音… ' + Math.round(p*100) + '%', p*10));
+    const pcm = await extractAudio(p => setStatus('正在抽出聲音… ' + Math.round(p*100) + '%', p*10), rs, re ? re - rs : 0);
     const total = pcm.length / 16000;
-    if(!duration) duration = total;
+    if(!duration) duration = rs + total;
 
     setStatus('載入語音辨識…');
     let tf;
@@ -240,15 +278,17 @@ async function transcribe(){
     }
     if(!asr) asr = await tf.pipeline('automatic-speech-recognition', MODEL, {device:'wasm', dtype:'q8', progress_callback});
 
-    segs = []; renderList();
+    segs = partial ? segs.filter(s => s.end <= rs || s.start >= rs + total) : [];
+    renderList();
     const WIN = 30 * 16000, nWin = Math.ceil(pcm.length / WIN);
     const lang = $('lang').value;
+    const strip = $('stripPy').checked && lang === 'chinese';
     stopAllowed = true; refreshButtons();
     const t0 = performance.now(); let done = 0;
     for(let w = 0; w < nWin; w++){
       if(stopFlag) break;
       const a = w * WIN, b = Math.min(pcm.length, a + WIN);
-      const base = a / 16000;
+      const base = rs + a / 16000;
       // 太安靜的段落直接跳過
       let sum = 0, n = 0;
       for(let i = a; i < b; i += 16){ const v = pcm[i] / 32768; sum += v*v; n++; }
@@ -256,25 +296,29 @@ async function transcribe(){
         const x = new Float32Array(b - a);
         for(let i = 0; i < x.length; i++) x[i] = pcm[a + i] / 32768;
         const opt = {return_timestamps:true, task:'transcribe'};
-        if(lang !== 'auto') opt.language = lang;
+        opt.language = lang;
         const out = await asr(x, opt);
         const list = out.chunks && out.chunks.length ? out.chunks : [{text: out.text, timestamp:[0, (b-a)/16000]}];
         let last = '';
         for(const c of list){
-          const txt = toTW((c.text || '').trim());
+          let txt = toTW((c.text || '').trim());
+          if(strip) txt = stripPinyin(txt).trim();
           if(!txt || txt === last) continue;
           last = txt;
           const s = base + (c.timestamp[0] || 0);
           const e = base + (c.timestamp[1] != null ? c.timestamp[1] : (b-a)/16000);
           segs.push({start: s, end: Math.max(e, s + 0.5), text: txt});
         }
+        segs.sort((x, y) => x.start - y.start);
         renderList();
       }
       done++;
       const el = (performance.now() - t0) / 1000, left = el / done * (nWin - done);
-      setStatus('轉文字中… ' + fmt(Math.min(total, (w+1)*30)) + ' / ' + fmt(total) + '（' + (device==='webgpu'?'顯示卡加速':'一般模式') + '，預估還要 ' + fmt(left) + '）', 20 + 80 * done / nWin);
+      setStatus('轉文字中… ' + fmt(rs + Math.min(total, (w+1)*30)) + ' / ' + fmt(rs + total) + '（' + (device==='webgpu'?'顯示卡加速':'一般模式') + '，預估還要 ' + fmt(left) + '）', 20 + 80 * done / nWin);
       await new Promise(r => setTimeout(r));
     }
+    segs.sort((x, y) => x.start - y.start);
+    renderList();
     saveLocal();
     setStatus(stopFlag ? '已停止，已轉好的部分都保留。記得按「儲存逐字稿」。' : '轉好了！共 ' + segs.length + ' 句。記得按「儲存逐字稿」。', 100);
   }catch(e){
@@ -371,21 +415,31 @@ function setRange(a, b){
 }
 
 /* ============ 剪輯清單 ============ */
+function includedClips(){ return clips.filter(c => c.include); }
+function updateSum(){
+  const sel = includedClips();
+  const sum = sel.reduce((t, c) => t + Math.max(0, c.end - c.start), 0);
+  $('sumInfo').textContent = clips.length ? ('已勾選 ' + sel.length + ' 段，共約 ' + Math.round(sum) + ' 秒') : '';
+}
 function renderClips(){
   const box = $('clips');
-  if(!clips.length){ box.innerHTML = '<div class="small" style="padding:10px 0">還沒有加入任何片段。</div>'; refreshButtons(); return; }
-  box.innerHTML = clips.map(c =>
+  if(!clips.length){ box.innerHTML = '<div class="small" style="padding:10px 0">還沒有加入任何片段。</div>'; updateSum(); refreshButtons(); return; }
+  box.innerHTML = clips.map((c, i) =>
     '<div class="clip" data-id="' + c.id + '">' +
+    '<input type="checkbox" class="inc" ' + (c.include ? 'checked' : '') + ' title="勾選＝要匯出">' +
+    '<span class="small">' + (i + 1) + '</span>' +
     '<input type="text" class="n" value="' + esc(c.name) + '" placeholder="檔名（可不填）">' +
     '<input type="text" class="t cs" value="' + fmt(c.start) + '"> – <input type="text" class="t ce" value="' + fmt(c.end) + '">' +
     '<span class="small">' + Math.round(c.end - c.start) + ' 秒</span>' +
+    '<button class="ghost up"' + (i === 0 ? ' disabled' : '') + '>↑</button><button class="ghost down"' + (i === clips.length - 1 ? ' disabled' : '') + '>↓</button>' +
     '<button class="ghost prev">預覽</button><button class="cutOne">剪出</button><button class="ghost del">刪除</button>' +
     '<span class="small st"></span></div>').join('');
-  refreshButtons();
+  updateSum(); refreshButtons();
 }
 function syncClip(row){
   const c = clips.find(x => x.id == row.dataset.id);
   c.name = row.querySelector('.n').value;
+  c.include = row.querySelector('.inc').checked;
   const s = parseTime(row.querySelector('.cs').value), e = parseTime(row.querySelector('.ce').value);
   if(!isNaN(s)) c.start = s;
   if(!isNaN(e)) c.end = e;
@@ -393,25 +447,31 @@ function syncClip(row){
 }
 let previewEnd = null;
 function previewClip(c){
-  const v = $('vid'); previewEnd = c.end; v.currentTime = c.start; v.play();
+  const v = $('vid');
+  v.scrollIntoView({behavior:'smooth', block:'center'});
+  previewEnd = c.end; v.currentTime = c.start; v.play();
+}
+async function runCut(c, outPath, precise, say, label){
+  const f = await ensureMounted();
+  const d = c.end - c.start;
+  const args = ['-ss', c.start.toFixed(3), '-i', '/in/input.mp4', '-t', d.toFixed(3)];
+  if(precise) args.push('-c:v','libx264','-preset','veryfast','-crf','23','-pix_fmt','yuv420p','-c:a','aac','-b:a','128k','-ar','48000','-ac','2','-movflags','+faststart');
+  else args.push('-c','copy','-avoid_negative_ts','make_zero');
+  args.push(outPath);
+  const cb = ({time}) => { if(precise && d) say(label + ' ' + Math.round(Math.min(1, (time/1e6)/d)*100) + '%'); };
+  f.on('progress', cb);
+  let code;
+  try { code = await f.exec(args); } finally { f.off('progress', cb); }
+  return code === 0;
 }
 async function cutClip(c, row){
   const st = row ? row.querySelector('.st') : null;
   const say = m => { if(st) st.textContent = m; setStatus(m); };
-  if(!(c.end > c.start)) { say('時間不對'); return false; }
+  if(!(c.end > c.start)){ say('時間不對'); return false; }
   say('剪出中…');
   const f = await ensureMounted();
-  const precise = $('precise').checked;
-  const d = c.end - c.start;
-  const args = ['-ss', c.start.toFixed(3), '-i', '/in/input.mp4', '-t', d.toFixed(3)];
-  if(precise) args.push('-c:v','libx264','-preset','veryfast','-crf','23','-pix_fmt','yuv420p','-c:a','aac','-b:a','128k','-movflags','+faststart');
-  else args.push('-c','copy','-avoid_negative_ts','make_zero');
-  args.push('/clip.mp4');
-  const cb = ({time}) => { if(precise && d) say('剪出中… ' + Math.round(Math.min(1, (time/1e6)/d)*100) + '%'); };
-  f.on('progress', cb);
-  let code;
-  try { code = await f.exec(args); } finally { f.off('progress', cb); }
-  if(code !== 0){ say('剪出失敗'); return false; }
+  const ok = await runCut(c, '/clip.mp4', $('precise').checked, say, '剪出中…');
+  if(!ok){ say('剪出失敗'); return false; }
   const data = await f.readFile('/clip.mp4');
   try { await f.deleteFile('/clip.mp4'); } catch(e) {}
   if(!data.length){ say('剪出失敗（檔案是空的）'); return false; }
@@ -419,6 +479,32 @@ async function cutClip(c, row){
   download(new Blob([data], {type:'video/mp4'}), name);
   say('已下載：' + name);
   return true;
+}
+async function mergeClips(sel){
+  const f = await ensureMounted();
+  const say = m => setStatus(m);
+  const made = [];
+  try{
+    for(let i = 0; i < sel.length; i++){
+      const c = sel[i];
+      if(!(c.end > c.start)) throw new Error('第 ' + (i + 1) + ' 段的時間不對');
+      const out = '/seg' + i + '.mp4';
+      const ok = await runCut(c, out, true, say, '合併中：剪第 ' + (i + 1) + ' / ' + sel.length + ' 段');
+      if(!ok) throw new Error('第 ' + (i + 1) + ' 段剪出失敗');
+      made.push(out);
+    }
+    say('合併中：接起來…');
+    await f.writeFile('/list.txt', made.map(q => "file '" + q + "'").join('\n') + '\n');
+    const code = await f.exec(['-f','concat','-safe','0','-i','/list.txt','-c','copy','-movflags','+faststart','/merged.mp4']);
+    if(code !== 0) throw new Error('把片段接起來失敗');
+    const data = await f.readFile('/merged.mp4');
+    if(!data.length) throw new Error('合併後的檔案是空的');
+    const nm = safe($('mergeName').value.trim() || (baseName() + '_合併' + sel.length + '段')) + '.mp4';
+    download(new Blob([data], {type:'video/mp4'}), nm);
+    say('已下載：' + nm);
+  } finally {
+    for(const q of made.concat(['/list.txt', '/merged.mp4'])){ try{ await f.deleteFile(q); }catch(e){} }
+  }
 }
 
 /* ============ 事件 ============ */
@@ -473,30 +559,46 @@ $('addClip').addEventListener('click', () => {
   if(isNaN(s) || isNaN(e) || e <= s){ setStatus('開始和結束時間不對，請檢查。', null, true); return; }
   const pad = parseFloat($('pad').value) || 0;
   s = Math.max(0, s - pad); e = duration ? Math.min(duration, e + pad) : e + pad;
-  clips.push({id: ++clipId, name:'', start:s, end:e});
+  clips.push({id: ++clipId, name:'', start:s, end:e, include:true});
   renderClips();
 });
 $('clips').addEventListener('click', async e => {
   const row = e.target.closest('.clip'); if(!row) return;
-  const c = syncClip(row);
-  if(e.target.classList.contains('prev')) previewClip(c);
-  else if(e.target.classList.contains('del')){ clips = clips.filter(x => x !== c); renderClips(); }
-  else if(e.target.classList.contains('cutOne')){
+  document.querySelectorAll('.clip').forEach(syncClip);
+  const c = clips.find(x => x.id == row.dataset.id);
+  const cl = e.target.classList;
+  if(cl.contains('inc')) updateSum();
+  else if(cl.contains('prev')) previewClip(c);
+  else if(cl.contains('del')){ clips = clips.filter(x => x !== c); renderClips(); }
+  else if(cl.contains('up') || cl.contains('down')){
+    const i = clips.indexOf(c), j = cl.contains('up') ? i - 1 : i + 1;
+    if(j >= 0 && j < clips.length){ [clips[i], clips[j]] = [clips[j], clips[i]]; renderClips(); }
+  }
+  else if(cl.contains('cutOne')){
     setBusy(true);
     try{ await cutClip(c, row); }catch(err){ console.error(err); setStatus('發生問題：' + err.message, null, true); }
     setBusy(false);
   }
 });
-$('clips').addEventListener('change', e => { const row = e.target.closest('.clip'); if(row){ const c = syncClip(row); renderClips(); } });
+$('clips').addEventListener('change', e => {
+  if(e.target.classList.contains('inc')) return;
+  const row = e.target.closest('.clip'); if(row){ syncClip(row); renderClips(); }
+});
 $('cutAll').addEventListener('click', async () => {
+  document.querySelectorAll('.clip').forEach(syncClip);
+  const sel = includedClips();
+  if(!sel.length){ setStatus('請先在清單勾選要匯出的片段。', null, true); return; }
+  const mode = document.querySelector('input[name=outmode]:checked').value;
   setBusy(true);
   try{
-    document.querySelectorAll('.clip').forEach(syncClip);
-    for(const c of clips){
-      const row = document.querySelector('.clip[data-id="' + c.id + '"]');
-      const ok = await cutClip(c, row);
-      if(!ok) break;
-      await new Promise(r => setTimeout(r, 400));
+    if(mode === 'merge' && sel.length >= 2) await mergeClips(sel);
+    else{
+      for(const c of sel){
+        const row = document.querySelector('.clip[data-id="' + c.id + '"]');
+        const ok = await cutClip(c, row);
+        if(!ok) break;
+        await new Promise(r => setTimeout(r, 400));
+      }
     }
   }catch(err){ console.error(err); setStatus('發生問題：' + err.message, null, true); }
   setBusy(false);
@@ -506,7 +608,66 @@ $('vid').addEventListener('timeupdate', () => {
   if(previewEnd != null && v.currentTime >= previewEnd){ v.pause(); previewEnd = null; }
 });
 
-window.ClipTool = {extractAudio, cutClip, get clips(){return clips;}, get segs(){return segs;}};
+/* ============ AI 提示詞 ============ */
+const AI_PROMPT = `你是一位幫華語老師剪 Instagram Reels 的短影音編輯。
+
+【背景】
+- 這是一堂華語線上課的逐字稿，老師是台灣人，學生是講西班牙文的人。上課中會中文、西班牙文夾雜。
+- 逐字稿每一行的開頭是時間（分:秒），後面是那一句的內容。
+- 逐字稿是機器自動產生的，有很多錯誤：學生的發音不標準，所以學生說的話常常聽錯；有時會出現英文句子；有時漢字後面會出現括號拼音，這些拼音是機器亂猜的，請完全忽略。
+- 如果某一句看起來不通順或像亂猜的，請不要拿它當作有趣的理由，也不要自己編造內容。
+
+【任務】
+請找出這堂課裡「有趣、適合剪成 Instagram Reels」的片段，給以西班牙文為母語的華語學習者看。
+有趣的標準包括（任一項即可）：
+1. 好笑的對話或誤會（例如學生把詞說錯、聽錯，結果意思變得很好笑）
+2. 讓人印象深刻的文化小知識（台灣用語、生活習慣）
+3. 很清楚的文法或詞語解釋，一個片段就能學到一個重點
+4. 老師和學生之間有趣的互動或反應
+5. 可以讓看的人想留言、想分享的內容
+
+【長度規則】
+- 目標是剪成大約 1 分鐘的影片。
+- 很長的有趣片段也請先列出來，不要因為太長就丟掉；請另外標出「如果要剪到 1 分鐘，建議留哪一段」。
+
+【輸出格式】
+先依「有趣程度」從高到低排序，最有趣的放最前面。每個片段請給：
+- 編號
+- 時間範圍：開始 – 結束（分:秒），以及大約幾秒
+- 有趣程度：高 / 中 / 低
+- 為什麼有趣（一兩句話，說明理由）
+- 內容摘要（用中文，一兩句話）
+- 如果超過 1 分鐘：建議剪成 1 分鐘的時間範圍
+- 建議的開頭字幕（Reels 前 3 秒的標題，用西班牙文，一句話，要能吸引人看下去）
+- 提醒事項（如果有）：例如「逐字稿這裡可能聽錯，請剪之前自己聽一遍」、「出現學生的個人資料（姓名、住址、電話、付款）」、「需要先問學生同意」
+
+【注意】
+- 只根據逐字稿裡真的有的內容，不要編造。
+- 不確定的地方請直接說不確定。
+- 最後請再附上一份「最推薦的前 3 個片段」的簡短清單。
+- 請全程用繁體中文回答（西班牙文標題除外）。`;
+const TEACHER_LINE = '\n- 請以老師說的話為主，學生說的話只當作參考。';
+function currentPrompt(){ return AI_PROMPT + ($('teacherOnly').checked ? TEACHER_LINE : ''); }
+async function copyText(txt, okMsg){
+  try{ await navigator.clipboard.writeText(txt); }
+  catch(e){
+    const ta = document.createElement('textarea');
+    ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand('copy'); }catch(e2){}
+    ta.remove();
+  }
+  $('copyMsg').textContent = okMsg;
+}
+$('copyPrompt').addEventListener('click', () => copyText(currentPrompt(), '已複製提示詞，去貼給 AI 吧。'));
+$('copyTx').addEventListener('click', () => {
+  if(!segs.length){ $('copyMsg').textContent = '還沒有逐字稿。'; return; }
+  copyText(segs.map(x => fmt(x.start) + ' ' + x.text).join('\n'), '已複製逐字稿（共 ' + segs.length + ' 句），貼在提示詞後面或下一則訊息。');
+});
+$('teacherOnly').addEventListener('change', () => { $('promptView').value = currentPrompt(); });
+$('promptView').value = currentPrompt();
+
+window.ClipTool = {extractAudio, cutClip, stripPinyin, get clips(){return clips;}, get segs(){return segs;}};
 refreshButtons();
 </script>
 </body>
