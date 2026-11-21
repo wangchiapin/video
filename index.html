@@ -36,6 +36,9 @@
   .seg .acts{flex:none;display:flex;gap:6px;align-items:flex-start}
   .seg .acts button{font-size:12px;padding:1px 9px}
   .seg .editIn{width:100%}
+  #dlg{position:fixed;inset:0;background:rgba(51,51,46,.45);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
+  #dlg .dbox{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:18px 20px;max-width:460px;width:100%}
+  #dlg .dmsg p{margin:0 0 8px}
   .edtag{margin-left:8px;font-size:11px;color:#8a4b2a;border:1px solid #d9c9b8;border-radius:4px;padding:0 5px}
   mark{background:var(--mark);padding:0}
   .clip{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
@@ -53,15 +56,16 @@
     <h2>① 選擇上課錄影</h2>
     <div class="row">
       <input type="file" id="fileIn" accept="video/*,.mp4,.mov,.mkv,.m4a,.mp3">
-      <button class="ghost" id="loadTx">載入已存的逐字稿（.json 或 .srt）</button>
+      <button class="ghost" id="loadTx">載入已存的逐字稿／清單（.json 或 .srt）</button>
       <input type="file" id="txIn" accept=".json,.srt" hidden>
     </div>
+    <div id="bakBar" class="small" hidden style="margin-top:8px">有自動留下的備份（放棄舊紀錄、重新轉文字、換掉逐字稿之前會自動留，最多 3 份）：<button class="ghost" id="bakBtn" style="padding:2px 10px;font-size:12px">查看／找回</button></div>
     <div id="vidBox" hidden style="margin-top:12px"><video id="vid" controls></video></div>
   </div>
 
   <div class="card">
     <h2>② 轉成文字</h2>
-    <div class="hint">第一次會下載語音辨識模型（約幾百 MB），之後瀏覽器會記住。轉文字的時候請不要關閉這個分頁，也不要讓電腦睡眠。轉好後記得按「儲存逐字稿」，下次就不用重轉。</div>
+    <div class="hint">第一次會下載語音辨識模型（約幾百 MB），之後瀏覽器會記住。轉文字的時候請不要關閉這個分頁，也不要讓電腦睡眠。轉好後記得按「儲存逐字稿與清單」，下次就不用重轉。</div>
     <div class="row">
       <label>語言
         <select id="lang">
@@ -71,7 +75,7 @@
       </label>
       <button id="goTx" disabled>開始轉文字</button>
       <button class="ghost" id="stopTx" disabled>停止</button>
-      <button class="ghost" id="saveTx" disabled>儲存逐字稿</button>
+      <button class="ghost" id="saveTx" disabled>儲存逐字稿與清單</button>
     </div>
     <div class="row" style="margin-top:8px">
       <label>只轉這段時間（不填＝整支影片）
@@ -103,6 +107,7 @@
       <button class="ghost" id="prevHit">上一個</button>
       <button class="ghost" id="nextHit">下一個</button>
       <span class="small" id="hitInfo"></span>
+      <button class="ghost" id="undoDel" hidden>↩ 復原刪除</button>
     </div>
     <div class="small" style="margin-bottom:8px">點一句＝跳到那裡並選為開頭；按住 Shift 再點另一句＝選到結尾。聽錯的字可以按那一句右邊的「編輯」修改，改完會自動存在這個瀏覽器裡，搜尋和複製給 AI 都會用改過的字。</div>
     <div id="list"><div class="small" style="padding:14px">還沒有逐字稿。</div></div>
@@ -156,6 +161,7 @@ let hits = [], hitPos = -1, query = '';
 let clips = [], clipId = 0;
 let ff = null, mounted = false, busy = false, stopFlag = false;
 let editIdx = -1, editBuf = '', focusEdit = false;   // 正在編輯哪一句
+let delStack = [];             // 刪掉的句子（可以復原）
 let toTW = null;
 try { toTW = OpenCC.Converter({from:'cn', to:'twp'}); } catch(e) { toTW = s => s; }
 
@@ -184,7 +190,7 @@ function setBusy(b){
 function refreshButtons(){
   $('goTx').disabled = busy || !file;
   $('stopTx').disabled = !busy || !stopAllowed;
-  $('saveTx').disabled = !segs.length;
+  $('saveTx').disabled = !segs.length && !clips.length;
   $('cutAll').disabled = busy || !clips.length || !file;
   document.querySelectorAll('.cutOne').forEach(b => b.disabled = busy);
   document.querySelectorAll('.seg .ed').forEach(b => b.disabled = busy);
@@ -256,7 +262,7 @@ async function extractAudio(onProgress, from = 0, dur = 0){
 /* ============ 轉文字（Whisper small，在瀏覽器裡跑） ============ */
 async function transcribe(){
   if(!file || busy) return;
-  stopFlag = false; stopAllowed = false; editIdx = -1; setBusy(true);
+  stopFlag = false; stopAllowed = false; editIdx = -1; backupNow(); delStack = []; updateUndoBtn(); setBusy(true);
   try{
     const vd = duration || $('vid').duration || 0;
     let rs = parseTime($('txS').value), re = parseTime($('txE').value);
@@ -328,7 +334,7 @@ async function transcribe(){
     segs.sort((x, y) => x.start - y.start);
     renderList();
     saveLocal();
-    setStatus(stopFlag ? '已停止，已轉好的部分都保留。記得按「儲存逐字稿」。' : '轉好了！共 ' + segs.length + ' 句。記得按「儲存逐字稿」。', 100);
+    setStatus(stopFlag ? '已停止，已轉好的部分都保留。記得按「儲存逐字稿與清單」。' : '轉好了！共 ' + segs.length + ' 句。記得按「儲存逐字稿與清單」。', 100);
   }catch(e){
     console.error(e);
     setStatus('發生問題：' + (e.message || e), null, true);
@@ -340,31 +346,168 @@ async function transcribe(){
 /* ============ 逐字稿存取 ============ */
 function localKey(){ return 'cliptool:' + file.name + ':' + file.size; }
 function saveLocal(){
-  try{ if(file && segs.length){ localStorage.setItem(localKey(), JSON.stringify(segs)); return true; } }catch(e){}
+  try{
+    if(!file) return false;
+    if(segs.length){ localStorage.setItem(localKey(), JSON.stringify(segs)); return true; }
+    localStorage.removeItem(localKey());
+  }catch(e){}
   return false;
+}
+/* ----- 自動備份（最多 3 份，放棄／重轉／換掉之前自動留） ----- */
+function bakKey(){ return 'cliptoolbak:' + file.name + ':' + file.size; }
+function readBackups(){
+  try{ const a = JSON.parse(localStorage.getItem(bakKey()) || '[]'); return Array.isArray(a) ? a : []; }catch(e){ return []; }
+}
+function backupNow(){
+  if(!file) return;
+  try{
+    const s = localStorage.getItem(localKey()), c = localStorage.getItem(clipsKey());
+    if(!s && !c) return;
+    const item = {t: Date.now(), segs: s ? JSON.parse(s) : null, clips: c ? JSON.parse(c) : null};
+    const list = readBackups();
+    const same = x => JSON.stringify([x.segs, x.clips]) === JSON.stringify([item.segs, item.clips]);
+    const rest = list.filter(x => !same(x));
+    localStorage.setItem(bakKey(), JSON.stringify([item].concat(rest).slice(0, 3)));
+  }catch(e){}
+  updateBakBar();
+}
+function updateBakBar(){
+  let n = 0;
+  try{ if(file) n = readBackups().length; }catch(e){}
+  $('bakBar').hidden = !n;
+}
+function fmtStamp(t){
+  const d = new Date(t), z = n => String(n).padStart(2, '0');
+  return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + z(d.getHours()) + ':' + z(d.getMinutes());
+}
+function pickBackup(list){
+  return new Promise(res => {
+    const ov = document.createElement('div');
+    ov.id = 'dlg';
+    ov.innerHTML = '<div class="dbox"><div class="dmsg"><p><b>自動備份</b>（最新的在最上面）</p><p class="small">找回哪一份，目前畫面上的逐字稿和清單會被取代，取代前也會自動備份，所以可以來回換。</p></div>' +
+      list.map((b, i) => '<div class="row" style="justify-content:space-between;padding:6px 0;border-top:1px solid var(--line)"><span>' + fmtStamp(b.t) + '　' + esc(recordSummary(b) || '（空的）') + '</span><button data-i="' + i + '">找回</button></div>').join('') +
+      '<div class="row" style="justify-content:flex-end;margin-top:12px"><button class="ghost" id="bakClose">關閉</button></div></div>';
+    document.body.appendChild(ov);
+    const done = v => { ov.remove(); res(v); };
+    ov.querySelectorAll('button[data-i]').forEach(b => b.onclick = () => done(+b.dataset.i));
+    ov.querySelector('#bakClose').onclick = () => done(-1);
+  });
+}
+async function openBackups(){
+  if(!file) return;
+  const list = readBackups();
+  if(!list.length){ updateBakBar(); return; }
+  const i = await pickBackup(list);
+  if(i < 0) return;
+  const item = list[i];
+  backupNow();                       // 先把目前的存成備份
+  delStack = []; updateUndoBtn(); editIdx = -1;
+  applyRecord({segs: item.segs, clips: item.clips});
+  doSearch();
+  setStatus('已找回 ' + fmtStamp(item.t) + ' 的備份：' + (recordSummary(item) || '空的') + '。', 0);
+}
+/* ----- 刪除一句／復原 ----- */
+function updateUndoBtn(){
+  const b = $('undoDel');
+  b.hidden = !delStack.length;
+  b.textContent = '↩ 復原刪除（' + delStack.length + '）';
+}
+function deleteSeg(){
+  const i = editIdx;
+  if(i < 0 || !segs[i]) return;
+  delStack.push(segs[i]); segs.splice(i, 1);
+  editIdx = -1; rangeA = rangeB = anchor = -1;
+  saveLocal(); rebuildHits(); renderList(); updateUndoBtn();
+  setStatus('已刪除這句。刪錯了可以按「復原刪除」。');
+}
+function undoDelete(){
+  if(!delStack.length || busy) return;
+  segs.push(delStack.pop());
+  segs.sort((a, b) => a.start - b.start);
+  rangeA = rangeB = anchor = -1;
+  saveLocal(); rebuildHits(); renderList(); updateUndoBtn();
+  setStatus('已復原。');
 }
 /* 剪輯清單也用「檔名＋檔案大小」存在瀏覽器裡 */
 function clipsKey(){ return 'cliptoolclips:' + file.name + ':' + file.size; }
+let suspendSave = false;   // 選影片、等你回答「載入／放棄」的時候，先不要動舊紀錄
 function saveClips(){
   try{
-    if(!file) return;
+    if(!file || suspendSave) return;
     if(clips.length) localStorage.setItem(clipsKey(), JSON.stringify(clips.map(c => ({name:c.name, start:c.start, end:c.end, include:c.include}))));
     else localStorage.removeItem(clipsKey());
   }catch(e){}
 }
-function loadClips(){
-  clips = []; clipId = 0;
+/* ----- 讀舊紀錄（只讀，不改動） ----- */
+function readSegsByKey(k){
   try{
-    const s = localStorage.getItem(clipsKey());
-    if(s) JSON.parse(s).forEach(c => {
-      if(c && isFinite(c.start) && isFinite(c.end)) clips.push({id: ++clipId, name: String(c.name || ''), start: +c.start, end: +c.end, include: c.include !== false});
-    });
+    const a = JSON.parse(localStorage.getItem(k) || 'null');
+    if(Array.isArray(a)){
+      const r = a.filter(s => s && typeof s.text === 'string' && isFinite(s.start));
+      if(r.length) return r;
+    }
   }catch(e){}
-  return clips.length;
+  return null;
 }
-function loadLocal(){
-  try{ const s = localStorage.getItem(localKey()); if(s){ segs = JSON.parse(s); return true; } }catch(e){}
-  return false;
+function readClipsByKey(k){
+  try{
+    const a = JSON.parse(localStorage.getItem(k) || 'null');
+    if(Array.isArray(a)){
+      const r = a.filter(c => c && isFinite(c.start) && isFinite(c.end)).map(c => ({name: String(c.name || ''), start: +c.start, end: +c.end, include: c.include !== false}));
+      if(r.length) return r;
+    }
+  }catch(e){}
+  return null;
+}
+/* 找同檔名、但大小不同的舊紀錄（挑逐字稿最多的那份） */
+function findOtherSizeRecord(f){
+  const pS = 'cliptool:' + f.name + ':', pC = 'cliptoolclips:' + f.name + ':';
+  const found = {};
+  try{
+    for(let i = 0; i < localStorage.length; i++){
+      const k = localStorage.key(i);
+      let size = null, kind = null;
+      if(k.startsWith(pS)){ size = k.slice(pS.length); kind = 'segs'; }
+      else if(k.startsWith(pC)){ size = k.slice(pC.length); kind = 'clips'; }
+      if(size === null || size === String(f.size) || !/^\d+$/.test(size)) continue;
+      const v = kind === 'segs' ? readSegsByKey(k) : readClipsByKey(k);
+      if(v){ (found[size] = found[size] || {size: +size})[kind] = v; }
+    }
+  }catch(e){}
+  let best = null;
+  Object.values(found).forEach(r => {
+    if(!best || ((r.segs ? r.segs.length : 0) > (best.segs ? best.segs.length : 0))) best = r;
+  });
+  return best;
+}
+function recordSummary(r){
+  const p = [];
+  if(r.segs){
+    const ed = r.segs.filter(s => s.orig != null).length;
+    p.push('逐字稿 ' + r.segs.length + ' 句' + (ed ? '（其中 ' + ed + ' 句是你改過的）' : ''));
+  }
+  if(r.clips) p.push('剪輯清單 ' + r.clips.length + ' 段');
+  return p.join('、');
+}
+function applyRecord(r){
+  segs = r.segs ? r.segs.map(s => Object.assign({}, s)) : [];
+  clips = (r.clips || []).map(c => Object.assign({id: ++clipId}, c));
+  rangeA = rangeB = anchor = -1;
+  renderList(); renderClips(); refreshButtons();
+  saveLocal();
+}
+/* 網頁裡的小視窗（不用瀏覽器內建的） */
+function askDialog(html, okText, noText){
+  return new Promise(res => {
+    const ov = document.createElement('div');
+    ov.id = 'dlg';
+    ov.innerHTML = '<div class="dbox"><div class="dmsg">' + html + '</div><div class="row" style="justify-content:flex-end;margin-top:14px"><button class="ghost" id="dlgNo">' + noText + '</button><button id="dlgOk">' + okText + '</button></div></div>';
+    document.body.appendChild(ov);
+    const done = v => { ov.remove(); res(v); };
+    ov.querySelector('#dlgOk').onclick = () => done(true);
+    ov.querySelector('#dlgNo').onclick = () => done(false);
+    ov.querySelector('#dlgOk').focus();
+  });
 }
 function download(blob, name){
   const a = document.createElement('a');
@@ -403,7 +546,7 @@ function renderList(){
       html += '<div class="seg in" data-i="' + i + '"><span class="tm">' + fmt(s.start) + '</span>' +
         '<span class="tx"><input type="text" class="editIn" value="' + esc(editBuf) + '"></span>' +
         '<span class="acts"><button class="ok">確定</button><button class="ghost cancel">取消</button>' +
-        (s.orig != null ? '<button class="ghost reset">還原這句</button>' : '') + '</span></div>';
+        (s.orig != null ? '<button class="ghost reset">還原這句</button>' : '') + '<button class="ghost del">刪除這句</button></span></div>';
       return;
     }
     let t = esc(s.text);
@@ -442,7 +585,7 @@ function commitEdit(){
   editIdx = -1;
   const saved = saveLocal();
   rebuildHits(); renderList();
-  setStatus(saved ? '已改好，也已自動存在這個瀏覽器裡。' : '已改好。因為還沒選影片，不會自動存，請按「儲存逐字稿」。', null, !saved);
+  setStatus(saved ? '已改好，也已自動存在這個瀏覽器裡。' : '已改好。因為還沒選影片，不會自動存，請按「儲存逐字稿與清單」。', null, !saved);
 }
 function resetEdit(){
   const i = editIdx;
@@ -596,40 +739,78 @@ $('fileIn').addEventListener('change', async e => {
   videoURL = URL.createObjectURL(f);
   const v = $('vid'); v.src = videoURL; $('vidBox').hidden = false;
   v.onloadedmetadata = () => { duration = v.duration || 0; };
-  const had = loadLocal();
-  const hadC = loadClips();
+  clipId = 0; delStack = []; updateUndoBtn();
+  suspendSave = true;           // 先顯示空白，不要動到舊紀錄
   renderList(); renderClips(); refreshButtons();
-  const parts = [];
-  if(had) parts.push('逐字稿（' + segs.length + ' 句）');
-  if(hadC) parts.push('剪輯清單（' + clips.length + ' 段）');
-  setStatus(parts.length ? '找到之前存的' + parts.join('和') + '，已載入。' : '已選好影片，可以按「開始轉文字」。', 0);
+  suspendSave = false;
+  setStatus('已選好影片，可以按「開始轉文字」。', 0);
+  updateBakBar();
+  const sizeKey = ':' + f.name + ':' + f.size;
+  const same = {segs: readSegsByKey('cliptool' + sizeKey), clips: readClipsByKey('cliptoolclips' + sizeKey)};
+  const keepNote = '<p class="small">選「放棄」＝當成新影片，從空白開始。舊紀錄會自動備份，之後可以在上面的「查看／找回」拿回來。</p>';
+  const keepNote2 = '<p class="small">選「不要」＝當成新影片，從空白開始。舊紀錄會繼續留著，不會被動到。</p>';
+  if(same.segs || same.clips){
+    const go = await askDialog('<p><b>這支影片之前用過</b>（檔名和大小都一樣）。</p><p>存著：' + recordSummary(same) + '。</p><p>要載入嗎？</p>' + keepNote, '載入', '放棄');
+    if(file !== f) return;
+    if(go){ applyRecord(same); setStatus('已載入之前存的：' + recordSummary(same) + '。', 0); }
+    else backupNow();
+    return;
+  }
+  const other = findOtherSizeRecord(f);
+  if(other){
+    const mb = n => (n / 1048576).toFixed(1) + ' MB';
+    const go = await askDialog('<p><b>之前有同檔名的影片紀錄，但檔案大小不一樣</b>（之前約 ' + mb(other.size) + '，這次約 ' + mb(f.size) + '）。可能是不同版本或重新匯出過，時間可能對不上。</p><p>存著：' + recordSummary(other) + '。</p><p>還是要載入嗎？</p>' + keepNote2, '還是載入', '不要，當新影片');
+    if(file !== f) return;
+    if(go){ applyRecord(other); setStatus('已載入同檔名舊紀錄：' + recordSummary(other) + '。請確認時間有沒有對上。', 0, true); }
+  }
 });
 $('loadTx').addEventListener('click', () => $('txIn').click());
 $('txIn').addEventListener('change', async e => {
   const f = e.target.files[0]; if(!f) return;
   const text = await f.text();
   try{
-    let arr;
+    let arr, cl = null;
     if(/\.srt$/i.test(f.name)) arr = parseSRT(text);
-    else { const j = JSON.parse(text); arr = Array.isArray(j) ? j : j.segments; }
+    else { const j = JSON.parse(text); arr = Array.isArray(j) ? j : j.segments; cl = Array.isArray(j) ? null : j.clips; }
     arr = (arr || []).filter(s => s && typeof s.text === 'string' && isFinite(s.start)).map(s => {
       const o = {start:+s.start, end:+s.end || +s.start + 1};
       if(typeof s.orig === 'string'){ o.text = s.text; o.orig = s.orig; }   // 改過的句子，保留你打的字
       else o.text = toTW(s.text);
       return o;
     });
-    if(!arr.length) throw new Error('裡面沒有可用的句子');
-    segs = arr; rangeA = rangeB = -1; editIdx = -1; doSearch(); refreshButtons();
-    setStatus('已載入逐字稿（' + segs.length + ' 句）。', 100);
-  }catch(err){ setStatus('逐字稿讀不進來：' + err.message, null, true); }
+    cl = (Array.isArray(cl) ? cl : []).filter(c => c && isFinite(c.start) && isFinite(c.end))
+      .map(c => ({name: String(c.name || ''), start: +c.start, end: +c.end, include: c.include !== false}));
+    if(!arr.length && !cl.length) throw new Error('裡面沒有可用的句子或剪輯清單');
+    backupNow();                    // 換掉之前先備份
+    const msg = [];
+    if(arr.length){
+      segs = arr; rangeA = rangeB = anchor = -1; editIdx = -1; delStack = []; updateUndoBtn();
+      saveLocal(); doSearch();
+      msg.push('逐字稿（' + segs.length + ' 句）');
+    }
+    if(cl.length){
+      let go = true;
+      if(clips.length) go = await askDialog('<p>這個檔案裡也有<b>剪輯清單（' + cl.length + ' 段）</b>。</p><p>目前畫面上的清單有 ' + clips.length + ' 段，載入會取代它（取代前已自動備份）。</p>', '一起載入', '只載入逐字稿');
+      if(go){
+        clips = cl.map(c => Object.assign({id: ++clipId}, c));
+        renderClips();
+        msg.push('剪輯清單（' + clips.length + ' 段）');
+      }
+    }
+    refreshButtons();
+    setStatus('已載入' + (msg.join('和') || '逐字稿') + '。', 100);
+  }catch(err){ setStatus('檔案讀不進來：' + err.message, null, true); }
   e.target.value = '';
 });
 $('goTx').addEventListener('click', transcribe);
 $('stopTx').addEventListener('click', () => { stopFlag = true; setStatus('正在停止…'); });
 $('saveTx').addEventListener('click', () => {
-  const data = {video: file ? {name:file.name, size:file.size, duration} : null, segments: segs};
+  const data = {video: file ? {name:file.name, size:file.size, duration} : null, segments: segs,
+    clips: clips.map(c => ({name:c.name, start:c.start, end:c.end, include:c.include}))};
   download(new Blob([JSON.stringify(data, null, 1)], {type:'application/json'}), safe(baseName()) + '.逐字稿.json');
 });
+$('bakBtn').addEventListener('click', openBackups);
+$('undoDel').addEventListener('click', undoDelete);
 $('q').addEventListener('input', doSearch);
 $('q').addEventListener('keydown', e => { if(e.key === 'Enter') gotoHit(hitPos + 1); });
 $('nextHit').addEventListener('click', () => gotoHit(hitPos + 1));
@@ -649,6 +830,7 @@ $('list').addEventListener('click', e => {
     else if(btn.classList.contains('ok')) commitEdit();
     else if(btn.classList.contains('cancel')) cancelEdit();
     else if(btn.classList.contains('reset')) resetEdit();
+    else if(btn.classList.contains('del')) deleteSeg();
     return;
   }
   if(e.target.closest('.editIn')) return;
