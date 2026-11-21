@@ -32,6 +32,11 @@
   .seg:hover{background:#faf8f2}
   .seg.in{background:var(--sel)}
   .seg .tm{flex:none;width:56px;color:var(--sub);font-variant-numeric:tabular-nums;font-size:13px;padding-top:1px}
+  .seg .tx{flex:1;min-width:0}
+  .seg .acts{flex:none;display:flex;gap:6px;align-items:flex-start}
+  .seg .acts button{font-size:12px;padding:1px 9px}
+  .seg .editIn{width:100%}
+  .edtag{margin-left:8px;font-size:11px;color:#8a4b2a;border:1px solid #d9c9b8;border-radius:4px;padding:0 5px}
   mark{background:var(--mark);padding:0}
   .clip{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
   .clip input.n{flex:1;min-width:140px}
@@ -99,7 +104,7 @@
       <button class="ghost" id="nextHit">下一個</button>
       <span class="small" id="hitInfo"></span>
     </div>
-    <div class="small" style="margin-bottom:8px">點一句＝跳到那裡並選為開頭；按住 Shift 再點另一句＝選到結尾。</div>
+    <div class="small" style="margin-bottom:8px">點一句＝跳到那裡並選為開頭；按住 Shift 再點另一句＝選到結尾。聽錯的字可以按那一句右邊的「編輯」修改，改完會自動存在這個瀏覽器裡，搜尋和複製給 AI 都會用改過的字。</div>
     <div id="list"><div class="small" style="padding:14px">還沒有逐字稿。</div></div>
 
     <div class="row" style="margin-top:12px">
@@ -125,6 +130,7 @@
       <button id="cutAll" disabled>匯出已勾選的片段</button>
       <span class="small" id="sumInfo"></span>
     </div>
+    <div class="small" style="margin-bottom:4px">清單會自動記住：存在這個瀏覽器裡，就算重新整理網頁，再選同一支影片，清單就會回來。</div>
     <div class="small">取消勾選精準剪會變得很快，但開頭可能多出好幾秒（會停在前一個關鍵畫面），適合先粗剪看看。每一段前面的方框勾起來才會匯出，可以用 ↑ ↓ 調順序。合併成一個檔案時一定會重新壓縮（等於精準剪）。分開存成多個檔案時，瀏覽器可能會詢問是否允許下載多個檔案，請按允許。</div>
     <div id="clips"><div class="small" style="padding:10px 0">還沒有加入任何片段。</div></div>
   </div>
@@ -149,6 +155,7 @@ let anchor = -1, rangeA = -1, rangeB = -1;
 let hits = [], hitPos = -1, query = '';
 let clips = [], clipId = 0;
 let ff = null, mounted = false, busy = false, stopFlag = false;
+let editIdx = -1, editBuf = '', focusEdit = false;   // 正在編輯哪一句
 let toTW = null;
 try { toTW = OpenCC.Converter({from:'cn', to:'twp'}); } catch(e) { toTW = s => s; }
 
@@ -180,6 +187,7 @@ function refreshButtons(){
   $('saveTx').disabled = !segs.length;
   $('cutAll').disabled = busy || !clips.length || !file;
   document.querySelectorAll('.cutOne').forEach(b => b.disabled = busy);
+  document.querySelectorAll('.seg .ed').forEach(b => b.disabled = busy);
 }
 let stopAllowed = false;
 function stripPinyin(t){
@@ -248,7 +256,7 @@ async function extractAudio(onProgress, from = 0, dur = 0){
 /* ============ 轉文字（Whisper small，在瀏覽器裡跑） ============ */
 async function transcribe(){
   if(!file || busy) return;
-  stopFlag = false; stopAllowed = false; setBusy(true);
+  stopFlag = false; stopAllowed = false; editIdx = -1; setBusy(true);
   try{
     const vd = duration || $('vid').duration || 0;
     let rs = parseTime($('txS').value), re = parseTime($('txE').value);
@@ -331,7 +339,29 @@ async function transcribe(){
 
 /* ============ 逐字稿存取 ============ */
 function localKey(){ return 'cliptool:' + file.name + ':' + file.size; }
-function saveLocal(){ try{ if(file && segs.length) localStorage.setItem(localKey(), JSON.stringify(segs)); }catch(e){} }
+function saveLocal(){
+  try{ if(file && segs.length){ localStorage.setItem(localKey(), JSON.stringify(segs)); return true; } }catch(e){}
+  return false;
+}
+/* 剪輯清單也用「檔名＋檔案大小」存在瀏覽器裡 */
+function clipsKey(){ return 'cliptoolclips:' + file.name + ':' + file.size; }
+function saveClips(){
+  try{
+    if(!file) return;
+    if(clips.length) localStorage.setItem(clipsKey(), JSON.stringify(clips.map(c => ({name:c.name, start:c.start, end:c.end, include:c.include}))));
+    else localStorage.removeItem(clipsKey());
+  }catch(e){}
+}
+function loadClips(){
+  clips = []; clipId = 0;
+  try{
+    const s = localStorage.getItem(clipsKey());
+    if(s) JSON.parse(s).forEach(c => {
+      if(c && isFinite(c.start) && isFinite(c.end)) clips.push({id: ++clipId, name: String(c.name || ''), start: +c.start, end: +c.end, include: c.include !== false});
+    });
+  }catch(e){}
+  return clips.length;
+}
 function loadLocal(){
   try{ const s = localStorage.getItem(localKey()); if(s){ segs = JSON.parse(s); return true; } }catch(e){}
   return false;
@@ -368,14 +398,60 @@ function renderList(){
   segs.forEach((s, i) => {
     const m = Math.floor(s.start / 60);
     if(m !== curMin){ curMin = m; html += '<div class="min">第 ' + fmt(m*60) + '</div>'; }
+    const inR = rangeA >= 0 && i >= rangeA && i <= rangeB;
+    if(i === editIdx){
+      html += '<div class="seg in" data-i="' + i + '"><span class="tm">' + fmt(s.start) + '</span>' +
+        '<span class="tx"><input type="text" class="editIn" value="' + esc(editBuf) + '"></span>' +
+        '<span class="acts"><button class="ok">確定</button><button class="ghost cancel">取消</button>' +
+        (s.orig != null ? '<button class="ghost reset">還原這句</button>' : '') + '</span></div>';
+      return;
+    }
     let t = esc(s.text);
     if(qf) t = highlight(s.text, foldMap(s.text), qf);
-    const inR = rangeA >= 0 && i >= rangeA && i <= rangeB;
-    html += '<div class="seg' + (inR ? ' in' : '') + '" data-i="' + i + '"><span class="tm">' + fmt(s.start) + '</span><span>' + t + '</span></div>';
+    if(s.orig != null) t += '<span class="edtag" title="這句是你改過的">已改</span>';
+    html += '<div class="seg' + (inR ? ' in' : '') + '" data-i="' + i + '"><span class="tm">' + fmt(s.start) + '</span>' +
+      '<span class="tx">' + t + '</span><span class="acts"><button class="ghost ed"' + (busy ? ' disabled' : '') + '>編輯</button></span></div>';
   });
   const keep = box.scrollTop;
   box.innerHTML = html;
   box.scrollTop = keep;
+  if(focusEdit){
+    focusEdit = false;
+    const inp = box.querySelector('.editIn');
+    if(inp){ inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
+  }
+}
+/* ----- 改逐字稿 ----- */
+function startEdit(i){
+  if(busy || !segs[i]) return;
+  editIdx = i; editBuf = segs[i].text; focusEdit = true;
+  $('vid').currentTime = segs[i].start;
+  renderList();
+}
+function cancelEdit(){ editIdx = -1; renderList(); }
+function commitEdit(){
+  const i = editIdx, t = editBuf.trim();
+  if(i < 0 || !segs[i]) return;
+  if(!t){ setStatus('這一句不能是空的。如果想回到原本的字，請按「還原這句」。', null, true); return; }
+  const s = segs[i];
+  if(t !== s.text){
+    if(s.orig == null) s.orig = s.text;
+    s.text = t;
+    if(s.orig === t) delete s.orig;
+  }
+  editIdx = -1;
+  const saved = saveLocal();
+  rebuildHits(); renderList();
+  setStatus(saved ? '已改好，也已自動存在這個瀏覽器裡。' : '已改好。因為還沒選影片，不會自動存，請按「儲存逐字稿」。', null, !saved);
+}
+function resetEdit(){
+  const i = editIdx;
+  if(i < 0 || !segs[i]) return;
+  const s = segs[i];
+  if(s.orig != null){ s.text = s.orig; delete s.orig; }
+  editIdx = -1;
+  saveLocal(); rebuildHits(); renderList();
+  setStatus('這一句已還原成機器轉出來的字。');
 }
 function highlight(text, fm, qf){
   let out = '', last = 0, pos = 0, k;
@@ -386,15 +462,18 @@ function highlight(text, fm, qf){
   }
   return out + esc(text.slice(last));
 }
-function doSearch(){
-  query = $('q').value.trim();
-  if(query) query = toTW(query);
+function rebuildHits(){
   hits = []; hitPos = -1;
   if(query){
     const qf = foldMap(query).f;
     segs.forEach((s, i) => { if(foldMap(s.text).f.includes(qf)) hits.push(i); });
   }
   $('hitInfo').textContent = query ? (hits.length ? '共 ' + hits.length + ' 句' : '找不到') : '';
+}
+function doSearch(){
+  query = $('q').value.trim();
+  if(query) query = toTW(query);
+  rebuildHits();
   renderList();
   if(hits.length) gotoHit(0);
 }
@@ -420,6 +499,7 @@ function updateSum(){
   const sel = includedClips();
   const sum = sel.reduce((t, c) => t + Math.max(0, c.end - c.start), 0);
   $('sumInfo').textContent = clips.length ? ('已勾選 ' + sel.length + ' 段，共約 ' + Math.round(sum) + ' 秒') : '';
+  saveClips();
 }
 function renderClips(){
   const box = $('clips');
@@ -511,14 +591,18 @@ async function mergeClips(sel){
 $('fileIn').addEventListener('change', async e => {
   const f = e.target.files[0]; if(!f) return;
   await resetMount();
-  file = f; segs = []; clips = []; rangeA = rangeB = anchor = -1; hits = []; query = ''; $('q').value = '';
+  file = f; segs = []; clips = []; rangeA = rangeB = anchor = -1; hits = []; query = ''; $('q').value = ''; editIdx = -1;
   if(videoURL) URL.revokeObjectURL(videoURL);
   videoURL = URL.createObjectURL(f);
   const v = $('vid'); v.src = videoURL; $('vidBox').hidden = false;
   v.onloadedmetadata = () => { duration = v.duration || 0; };
   const had = loadLocal();
+  const hadC = loadClips();
   renderList(); renderClips(); refreshButtons();
-  setStatus(had ? '找到之前轉好的逐字稿，已載入（' + segs.length + ' 句）。' : '已選好影片，可以按「開始轉文字」。', 0);
+  const parts = [];
+  if(had) parts.push('逐字稿（' + segs.length + ' 句）');
+  if(hadC) parts.push('剪輯清單（' + clips.length + ' 段）');
+  setStatus(parts.length ? '找到之前存的' + parts.join('和') + '，已載入。' : '已選好影片，可以按「開始轉文字」。', 0);
 });
 $('loadTx').addEventListener('click', () => $('txIn').click());
 $('txIn').addEventListener('change', async e => {
@@ -528,9 +612,14 @@ $('txIn').addEventListener('change', async e => {
     let arr;
     if(/\.srt$/i.test(f.name)) arr = parseSRT(text);
     else { const j = JSON.parse(text); arr = Array.isArray(j) ? j : j.segments; }
-    arr = (arr || []).filter(s => s && typeof s.text === 'string' && isFinite(s.start)).map(s => ({start:+s.start, end:+s.end || +s.start + 1, text: toTW(s.text)}));
+    arr = (arr || []).filter(s => s && typeof s.text === 'string' && isFinite(s.start)).map(s => {
+      const o = {start:+s.start, end:+s.end || +s.start + 1};
+      if(typeof s.orig === 'string'){ o.text = s.text; o.orig = s.orig; }   // 改過的句子，保留你打的字
+      else o.text = toTW(s.text);
+      return o;
+    });
     if(!arr.length) throw new Error('裡面沒有可用的句子');
-    segs = arr; rangeA = rangeB = -1; doSearch(); refreshButtons();
+    segs = arr; rangeA = rangeB = -1; editIdx = -1; doSearch(); refreshButtons();
     setStatus('已載入逐字稿（' + segs.length + ' 句）。', 100);
   }catch(err){ setStatus('逐字稿讀不進來：' + err.message, null, true); }
   e.target.value = '';
@@ -545,9 +634,24 @@ $('q').addEventListener('input', doSearch);
 $('q').addEventListener('keydown', e => { if(e.key === 'Enter') gotoHit(hitPos + 1); });
 $('nextHit').addEventListener('click', () => gotoHit(hitPos + 1));
 $('prevHit').addEventListener('click', () => gotoHit(hitPos - 1));
+$('list').addEventListener('input', e => { if(e.target.classList.contains('editIn')) editBuf = e.target.value; });
+$('list').addEventListener('keydown', e => {
+  if(!e.target.classList.contains('editIn')) return;
+  if(e.key === 'Enter' && !e.isComposing && e.keyCode !== 229){ e.preventDefault(); commitEdit(); }
+  else if(e.key === 'Escape'){ e.preventDefault(); cancelEdit(); }
+});
 $('list').addEventListener('click', e => {
   const row = e.target.closest('.seg'); if(!row) return;
   const i = +row.dataset.i;
+  const btn = e.target.closest('button');
+  if(btn){
+    if(btn.classList.contains('ed')) startEdit(i);
+    else if(btn.classList.contains('ok')) commitEdit();
+    else if(btn.classList.contains('cancel')) cancelEdit();
+    else if(btn.classList.contains('reset')) resetEdit();
+    return;
+  }
+  if(e.target.closest('.editIn')) return;
   if(e.shiftKey && anchor >= 0) setRange(anchor, i);
   else { anchor = i; setRange(i, i); }
   $('vid').currentTime = segs[i].start;
@@ -579,6 +683,9 @@ $('clips').addEventListener('click', async e => {
     try{ await cutClip(c, row); }catch(err){ console.error(err); setStatus('發生問題：' + err.message, null, true); }
     setBusy(false);
   }
+});
+$('clips').addEventListener('input', e => {
+  const row = e.target.closest('.clip'); if(row){ syncClip(row); updateSum(); }
 });
 $('clips').addEventListener('change', e => {
   if(e.target.classList.contains('inc')) return;
