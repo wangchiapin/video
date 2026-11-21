@@ -135,6 +135,10 @@
       <button id="cutAll" disabled>匯出已勾選的片段</button>
       <span class="small" id="sumInfo"></span>
     </div>
+    <div id="cutBox" hidden style="margin-bottom:8px">
+      <div id="cutMsg" style="font-size:16px;font-weight:600"></div>
+      <div class="bar" id="cutBarWrap"><i id="cutBarFill"></i></div>
+    </div>
     <div class="small" style="margin-bottom:4px">清單會自動記住：存在這個瀏覽器裡，就算重新整理網頁，再選同一支影片，清單就會回來。</div>
     <div class="small">取消勾選精準剪會變得很快，但開頭可能多出好幾秒（會停在前一個關鍵畫面），適合先粗剪看看。每一段前面的方框勾起來才會匯出，可以用 ↑ ↓ 調順序。合併成一個檔案時一定會重新壓縮（等於精準剪）。分開存成多個檔案時，瀏覽器可能會詢問是否允許下載多個檔案，請按允許。</div>
     <div id="clips"><div class="small" style="padding:10px 0">還沒有加入任何片段。</div></div>
@@ -183,6 +187,14 @@ function setStatus(msg, pct, warn){
   const el = $('status'); el.textContent = msg || ''; el.className = 'small' + (warn ? ' warn' : '');
   if(pct != null) $('barFill').style.width = Math.max(0, Math.min(100, pct)) + '%';
 }
+let exporting = false, batchInfo = '';
+function setCutStatus(msg, pct, warn){
+  const box = $('cutBox'); box.hidden = false;
+  const m = $('cutMsg'); m.textContent = msg || ''; m.style.color = warn ? '#8a4b2a' : '';
+  const w = $('cutBarWrap');
+  if(pct != null){ w.style.visibility = 'visible'; $('cutBarFill').style.width = Math.max(0, Math.min(100, pct)) + '%'; }
+  else w.style.visibility = 'hidden';
+}
 function setBusy(b){
   busy = b;
   refreshButtons();
@@ -192,6 +204,7 @@ function refreshButtons(){
   $('stopTx').disabled = !busy || !stopAllowed;
   $('saveTx').disabled = !segs.length && !clips.length;
   $('cutAll').disabled = busy || !clips.length || !file;
+  $('cutAll').textContent = (busy && exporting) ? '剪出中，請稍候…' : '匯出已勾選的片段';
   document.querySelectorAll('.cutOne').forEach(b => b.disabled = busy);
   document.querySelectorAll('.seg .ed').forEach(b => b.disabled = busy);
 }
@@ -681,7 +694,7 @@ async function runCut(c, outPath, precise, say, label){
   if(precise) args.push('-c:v','libx264','-preset','veryfast','-crf','23','-pix_fmt','yuv420p','-c:a','aac','-b:a','128k','-ar','48000','-ac','2','-movflags','+faststart');
   else args.push('-c','copy','-avoid_negative_ts','make_zero');
   args.push(outPath);
-  const cb = ({time}) => { if(precise && d) say(label + ' ' + Math.round(Math.min(1, (time/1e6)/d)*100) + '%'); };
+  const cb = ({time}) => { if(precise && d){ const p = Math.round(Math.min(1, (time/1e6)/d)*100); say(label + ' ' + p + '%', p); } };
   f.on('progress', cb);
   let code;
   try { code = await f.exec(args); } finally { f.off('progress', cb); }
@@ -689,23 +702,23 @@ async function runCut(c, outPath, precise, say, label){
 }
 async function cutClip(c, row){
   const st = row ? row.querySelector('.st') : null;
-  const say = m => { if(st) st.textContent = m; setStatus(m); };
-  if(!(c.end > c.start)){ say('時間不對'); return false; }
-  say('剪出中…');
+  const say = (m, p, warn) => { if(st) st.textContent = m; setStatus(m, p, warn); setCutStatus(m + (warn ? '' : batchInfo), p, warn); };
+  if(!(c.end > c.start)){ say('時間不對', null, true); return false; }
+  say('剪出中…', $('precise').checked ? 0 : null);
   const f = await ensureMounted();
   const ok = await runCut(c, '/clip.mp4', $('precise').checked, say, '剪出中…');
-  if(!ok){ say('剪出失敗'); return false; }
+  if(!ok){ say('剪出失敗', null, true); return false; }
   const data = await f.readFile('/clip.mp4');
   try { await f.deleteFile('/clip.mp4'); } catch(e) {}
-  if(!data.length){ say('剪出失敗（檔案是空的）'); return false; }
+  if(!data.length){ say('剪出失敗（檔案是空的）', null, true); return false; }
   const name = safe(c.name.trim() || (baseName() + '_' + fmt(c.start).replace(/:/g,'') + '-' + fmt(c.end).replace(/:/g,''))) + '.mp4';
   download(new Blob([data], {type:'video/mp4'}), name);
-  say('已下載：' + name);
+  say('已下載：' + name, 100);
   return true;
 }
 async function mergeClips(sel){
   const f = await ensureMounted();
-  const say = m => setStatus(m);
+  const say = (m, p) => { setStatus(m, p); setCutStatus(m, p); };
   const made = [];
   try{
     for(let i = 0; i < sel.length; i++){
@@ -716,7 +729,7 @@ async function mergeClips(sel){
       if(!ok) throw new Error('第 ' + (i + 1) + ' 段剪出失敗');
       made.push(out);
     }
-    say('合併中：接起來…');
+    say('合併中：接起來…', null);
     await f.writeFile('/list.txt', made.map(q => "file '" + q + "'").join('\n') + '\n');
     const code = await f.exec(['-f','concat','-safe','0','-i','/list.txt','-c','copy','-movflags','+faststart','/merged.mp4']);
     if(code !== 0) throw new Error('把片段接起來失敗');
@@ -724,7 +737,7 @@ async function mergeClips(sel){
     if(!data.length) throw new Error('合併後的檔案是空的');
     const nm = safe($('mergeName').value.trim() || (baseName() + '_合併' + sel.length + '段')) + '.mp4';
     download(new Blob([data], {type:'video/mp4'}), nm);
-    say('已下載：' + nm);
+    say('完成，已下載合併檔：' + nm, 100);
   } finally {
     for(const q of made.concat(['/list.txt', '/merged.mp4'])){ try{ await f.deleteFile(q); }catch(e){} }
   }
@@ -861,9 +874,9 @@ $('clips').addEventListener('click', async e => {
     if(j >= 0 && j < clips.length){ [clips[i], clips[j]] = [clips[j], clips[i]]; renderClips(); }
   }
   else if(cl.contains('cutOne')){
-    setBusy(true);
-    try{ await cutClip(c, row); }catch(err){ console.error(err); setStatus('發生問題：' + err.message, null, true); }
-    setBusy(false);
+    exporting = true; batchInfo = ''; setBusy(true);
+    try{ await cutClip(c, row); }catch(err){ console.error(err); setStatus('發生問題：' + err.message, null, true); setCutStatus('發生問題：' + err.message, null, true); }
+    exporting = false; setBusy(false);
   }
 });
 $('clips').addEventListener('input', e => {
@@ -878,19 +891,25 @@ $('cutAll').addEventListener('click', async () => {
   const sel = includedClips();
   if(!sel.length){ setStatus('請先在清單勾選要匯出的片段。', null, true); return; }
   const mode = document.querySelector('input[name=outmode]:checked').value;
-  setBusy(true);
+  exporting = true; batchInfo = ''; setBusy(true);
   try{
     if(mode === 'merge' && sel.length >= 2) await mergeClips(sel);
     else{
-      for(const c of sel){
+      let n = 0;
+      for(let i = 0; i < sel.length; i++){
+        const c = sel[i];
+        batchInfo = sel.length > 1 ? '（第 ' + (i + 1) + ' / ' + sel.length + ' 段）' : '';
         const row = document.querySelector('.clip[data-id="' + c.id + '"]');
         const ok = await cutClip(c, row);
-        if(!ok) break;
+        if(!ok){ setCutStatus('第 ' + (i + 1) + ' 段剪出失敗，已停止', null, true); break; }
+        n++;
         await new Promise(r => setTimeout(r, 400));
       }
+      batchInfo = '';
+      if(n === sel.length) setCutStatus('完成，已下載 ' + n + ' 個檔案', 100);
     }
-  }catch(err){ console.error(err); setStatus('發生問題：' + err.message, null, true); }
-  setBusy(false);
+  }catch(err){ console.error(err); setStatus('發生問題：' + err.message, null, true); setCutStatus('發生問題：' + err.message, null, true); }
+  exporting = false; setBusy(false);
 });
 $('vid').addEventListener('timeupdate', () => {
   const v = $('vid');
